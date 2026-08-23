@@ -29,9 +29,9 @@ engine never adjudicates on its own, and never silently drops a write.
   input, imported back into claims on an explicit scan. You can open, diff, and repair
   everything.
 - **No black box.** No LLM on the write path, no vector database, no graph, no
-  background file watcher. Deterministic identity resolution (normalized aliases +
-  content hashing) so the same fact under different phrasings still collapses or
-  conflicts instead of silently duplicating.
+  background file watcher. v1 identity is deterministic and conservative: exact
+  canonical `(entity, key)` slots collapse or conflict; semantic key equivalence is
+  not guessed on the write path.
 - **Reachable from anywhere.** It's an MCP server — Claude Code, claude.ai, Cursor, or
   any MCP client shares the same source of truth.
 
@@ -40,8 +40,9 @@ engine never adjudicates on its own, and never silently drops a write.
 v1, in development. The release gate is a single demo that has to speak for itself:
 
 > three agents, one folder, overlapping writes → **one canonical note, tombstones for
-> the duplicates, one conflict object preserving both claims, zero silent clobbers** —
-> including agents that name the same fact under *different* keys.
+> the duplicates, one conflict object preserving both claims, zero silent clobbers**.
+> Same-fact-different-key cases must be surfaced honestly, not false-merged by a toy
+> thesaurus.
 
 If that demo needs narration to explain why it won, it isn't done.
 

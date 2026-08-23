@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,7 +17,10 @@ func testStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 23, 2, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
 	s.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
 		now = now.Add(time.Second)
 		return now
 	}
@@ -84,7 +88,7 @@ func TestPutClaimInsertCollapseConflict(t *testing.T) {
 	}
 }
 
-func TestDifferentKeysSameFactCollapseDeterministically(t *testing.T) {
+func TestDifferentKeysSameFactDoNotAutoCollapse(t *testing.T) {
 	s := testStore(t)
 	first, err := s.PutClaim(ClaimInput{
 		Entity:     "Acme Inc",
@@ -105,23 +109,20 @@ func TestDifferentKeysSameFactCollapseDeterministically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dup.Status != ResultCollapsed {
-		t.Fatalf("status = %q, want collapsed for same fact under different key", dup.Status)
+	if dup.Status != ResultInserted {
+		t.Fatalf("status = %q, want inserted for different key without declared alias", dup.Status)
 	}
-	if dup.Claim.DuplicateReason != "same_entity_equal_value_different_key" {
-		t.Fatalf("duplicate reason = %q", dup.Claim.DuplicateReason)
-	}
-	if dup.RedirectTo != first.Claim.ID {
-		t.Fatalf("redirect = %q, want %q", dup.RedirectTo, first.Claim.ID)
+	if dup.RedirectTo != "" || dup.Claim.DuplicateOf != "" {
+		t.Fatalf("different key auto-collapsed: %+v", dup)
 	}
 }
 
-func TestDifferentPhrasingEquivalentKeyConflicts(t *testing.T) {
+func TestDifferentKeysDifferentSpellingsDoNotSilentlyMerge(t *testing.T) {
 	s := testStore(t)
 	first, err := s.PutClaim(ClaimInput{
 		Entity:     "Acme",
-		Key:        "headquarters",
-		Value:      "Paris",
+		Key:        "founding date",
+		Value:      "May 1, 2024",
 		Provenance: "agent-a",
 	})
 	if err != nil {
@@ -129,19 +130,95 @@ func TestDifferentPhrasingEquivalentKeyConflicts(t *testing.T) {
 	}
 	got, err := s.PutClaim(ClaimInput{
 		Entity:     "Acme",
-		Key:        "HQ location",
-		Value:      "Berlin",
+		Key:        "first day",
+		Value:      "2024-05-01",
 		Provenance: "agent-b",
 		BaseHash:   first.IndexHash,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != ResultConflicted {
-		t.Fatalf("status = %q, want conflict for equivalent key with different value", got.Status)
+	if got.Status != ResultInserted {
+		t.Fatalf("status = %q, want separate candidate until alias/semantic identity exists", got.Status)
 	}
-	if got.Conflict == nil || got.Conflict.Existing.Provenance != "agent-a" || got.Conflict.Incoming.Provenance != "agent-b" {
-		t.Fatalf("conflict provenance not preserved: %+v", got.Conflict)
+}
+
+func TestEqualValuesUnderDifferentKeysDoNotCollapse(t *testing.T) {
+	s := testStore(t)
+	first, err := s.PutClaim(ClaimInput{Entity: "Acme", Key: "employees", Value: "100", Provenance: "agent-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.PutClaim(ClaimInput{Entity: "Acme", Key: "offices", Value: "100", Provenance: "agent-b", BaseHash: first.IndexHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != ResultInserted || got.RedirectTo != "" {
+		t.Fatalf("employees/offices equal value collapsed: %+v", got)
+	}
+}
+
+func TestConcurrentPutClaimsSerializeToConflict(t *testing.T) {
+	s := testStore(t)
+	var wg sync.WaitGroup
+	results := make(chan PutResult, 2)
+	errs := make(chan error, 2)
+	for _, in := range []ClaimInput{
+		{Entity: "Canon", Key: "status", Value: "ratified", Provenance: "alice"},
+		{Entity: "Canon", Key: "status", Value: "debating", Provenance: "bob"},
+	} {
+		wg.Add(1)
+		go func(in ClaimInput) {
+			defer wg.Done()
+			got, err := s.PutClaim(in)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- got
+		}(in)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for got := range results {
+		counts[got.Status]++
+	}
+	if counts[ResultInserted] != 1 || counts[ResultConflicted] != 1 {
+		t.Fatalf("statuses = %+v, want one inserted and one conflicted", counts)
+	}
+	idx, err := s.Rebuild()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Conflicts) != 1 {
+		t.Fatalf("conflicts = %d, want 1", len(idx.Conflicts))
+	}
+}
+
+func TestRebuildRepairsRacyLogAsConflict(t *testing.T) {
+	s := testStore(t)
+	a := newClaim(ClaimInput{Entity: "Canon", Key: "status", Value: "ratified", Provenance: "alice"}, s.now())
+	b := newClaim(ClaimInput{Entity: "Canon", Key: "status", Value: "debating", Provenance: "bob"}, s.now())
+	if err := s.appendEvent(Event{Type: EventClaim, ID: a.ID, TS: a.TS, Claim: &a}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.appendEvent(Event{Type: EventClaim, ID: b.ID, TS: b.TS, Claim: &b}); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := s.Rebuild()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Conflicts) != 1 {
+		t.Fatalf("conflicts = %d, want replay-created conflict", len(idx.Conflicts))
+	}
+	if idx.Current[slotKey(a.CanonicalEntity, a.CanonicalKey)] != a.ID {
+		t.Fatalf("current was overwritten by racy claim: %+v", idx.Current)
 	}
 }
 
@@ -210,6 +287,71 @@ func TestResolveConflictAndRetractAreRecorded(t *testing.T) {
 	}
 	if !idx.Claims[first.Claim.ID].Retracted {
 		t.Fatalf("claim not marked retracted: %+v", idx.Claims[first.Claim.ID])
+	}
+}
+
+func TestResolveConflictChooseIncomingLeavesOneProjectedFact(t *testing.T) {
+	s := testStore(t)
+	first, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "license", Value: "AGPL-3.0", Provenance: "agent-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicted, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "license", Value: "Apache-2.0", Provenance: "agent-b", BaseHash: first.IndexHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveConflict(conflicted.Conflict.ID, conflicted.Conflict.Incoming.ID, "", "jeff"); err != nil {
+		t.Fatal(err)
+	}
+	note := readFile(t, filepath.Join(s.root, "canon.md"))
+	if strings.Count(note, "canon-claim") != 1 {
+		t.Fatalf("projection has multiple facts after choose-incoming:\n%s", note)
+	}
+	if strings.Contains(note, "AGPL") || !strings.Contains(note, "Apache-2.0") {
+		t.Fatalf("projection did not keep only incoming value:\n%s", note)
+	}
+	claims, err := s.Search("license")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Value != "Apache-2.0" {
+		t.Fatalf("search claims = %+v, want only chosen incoming", claims)
+	}
+}
+
+func TestRepeatedReassertGetsUniqueClaimID(t *testing.T) {
+	s := testStore(t)
+	first, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "status", Value: "ratified", Provenance: "agent-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "status", Value: "ratified", Provenance: "agent-a", BaseHash: first.IndexHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dup.Claim.ID == first.Claim.ID {
+		t.Fatalf("duplicate reassert reused claim id %q", dup.Claim.ID)
+	}
+	if dup.RedirectTo != first.Claim.ID {
+		t.Fatalf("duplicate redirect = %q, want %q", dup.RedirectTo, first.Claim.ID)
+	}
+}
+
+func TestRetractDeletesProjection(t *testing.T) {
+	s := testStore(t)
+	first, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "status", Value: "ratified", Provenance: "agent-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.root, "canon.md")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RetractClaim(first.Claim.ID, "cleanup"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("projection still exists after retract: err=%v", err)
 	}
 }
 

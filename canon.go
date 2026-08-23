@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -32,6 +34,7 @@ const (
 	canonDir     = ".canon"
 	eventLogFile = "events.jsonl"
 	indexFile    = "index.json"
+	lockFile     = "events.lock"
 )
 
 var (
@@ -43,6 +46,7 @@ var (
 type Store struct {
 	root string
 	now  func() time.Time
+	mu   sync.Mutex
 }
 
 type ClaimInput struct {
@@ -153,6 +157,16 @@ func (s *Store) Root() string {
 }
 
 func (s *Store) PutClaim(in ClaimInput) (PutResult, error) {
+	var out PutResult
+	err := s.withWriteLock(func() error {
+		var err error
+		out, err = s.putClaimLocked(in)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) putClaimLocked(in ClaimInput) (PutResult, error) {
 	if err := validateClaim(in); err != nil {
 		return PutResult{}, err
 	}
@@ -182,14 +196,7 @@ func (s *Store) PutClaim(in ClaimInput) (PutResult, error) {
 			}
 			return PutResult{Status: ResultCollapsed, Claim: claim, Existing: &existing, RedirectTo: existing.ID, IndexHash: idx.Hash}, nil
 		}
-		conflict := Conflict{
-			ID:           idFor("conflict", claim.CanonicalEntity, claim.CanonicalKey, existing.ValueHash, claim.ValueHash, now.Format(time.RFC3339Nano)),
-			Entity:       existing.CanonicalEntity,
-			CanonicalKey: claim.CanonicalKey,
-			Existing:     existing,
-			Incoming:     claim,
-			TS:           now,
-		}
+		conflict := conflictFor(existing, claim, now)
 		if err := s.appendEvent(Event{Type: EventConflict, ID: conflict.ID, TS: now, Conflict: &conflict}); err != nil {
 			return PutResult{}, err
 		}
@@ -198,20 +205,6 @@ func (s *Store) PutClaim(in ClaimInput) (PutResult, error) {
 			return PutResult{}, err
 		}
 		return PutResult{Status: ResultConflicted, Claim: claim, Existing: &existing, Conflict: &conflict, IndexHash: idx.Hash}, nil
-	}
-
-	if existingID := idx.sameEntitySameValue(claim.CanonicalEntity, claim.ValueHash); existingID != "" {
-		existing := idx.Claims[existingID]
-		claim.DuplicateOf = existing.ID
-		claim.DuplicateReason = "same_entity_equal_value_different_key"
-		if err := s.appendEvent(Event{Type: EventClaim, ID: claim.ID, TS: now, Claim: &claim}); err != nil {
-			return PutResult{}, err
-		}
-		idx, err = s.Rebuild()
-		if err != nil {
-			return PutResult{}, err
-		}
-		return PutResult{Status: ResultCollapsed, Claim: claim, Existing: &existing, RedirectTo: existing.ID, IndexHash: idx.Hash}, nil
 	}
 
 	if err := s.appendEvent(Event{Type: EventClaim, ID: claim.ID, TS: now, Claim: &claim}); err != nil {
@@ -225,6 +218,16 @@ func (s *Store) PutClaim(in ClaimInput) (PutResult, error) {
 }
 
 func (s *Store) ResolveConflict(conflictID, chosenClaimID, supersedingValue, provenance string) (Resolution, error) {
+	var out Resolution
+	err := s.withWriteLock(func() error {
+		var err error
+		out, err = s.resolveConflictLocked(conflictID, chosenClaimID, supersedingValue, provenance)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) resolveConflictLocked(conflictID, chosenClaimID, supersedingValue, provenance string) (Resolution, error) {
 	idx, err := s.Rebuild()
 	if err != nil {
 		return Resolution{}, err
@@ -259,6 +262,16 @@ func (s *Store) ResolveConflict(conflictID, chosenClaimID, supersedingValue, pro
 }
 
 func (s *Store) RetractClaim(claimID, provenance string) (Retraction, error) {
+	var out Retraction
+	err := s.withWriteLock(func() error {
+		var err error
+		out, err = s.retractClaimLocked(claimID, provenance)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) retractClaimLocked(claimID, provenance string) (Retraction, error) {
 	idx, err := s.Rebuild()
 	if err != nil {
 		return Retraction{}, err
@@ -381,7 +394,23 @@ func (s *Store) rebuild(render bool) (Index, error) {
 				idx.Tombstones[c.ID] = c.DuplicateReason
 				continue
 			}
-			idx.Current[slotKey(c.CanonicalEntity, c.CanonicalKey)] = c.ID
+			slot := slotKey(c.CanonicalEntity, c.CanonicalKey)
+			if existingID := idx.Current[slot]; existingID != "" {
+				existing := idx.Claims[existingID]
+				if valuesEqual(existing.Value, c.Value) {
+					c.DuplicateOf = existing.ID
+					c.DuplicateReason = "replay_same_entity_key_equal_value"
+					idx.Claims[c.ID] = c
+					idx.Redirects[c.ID] = existing.ID
+					idx.Tombstones[c.ID] = c.DuplicateReason
+					continue
+				}
+				conflict := conflictFor(existing, c, c.TS)
+				idx.Conflicts[conflict.ID] = conflict
+				idx.Tombstones[c.ID] = "conflicted"
+				continue
+			}
+			idx.Current[slot] = c.ID
 		case EventConflict:
 			if ev.Conflict == nil {
 				return Index{}, fmt.Errorf("conflict event %q missing conflict", ev.ID)
@@ -402,6 +431,7 @@ func (s *Store) rebuild(render bool) (Index, error) {
 			conflict.ResolutionID = res.ID
 			idx.Conflicts[conflict.ID] = conflict
 			chosen := conflict.Existing
+			loserID := conflict.Incoming.ID
 			switch {
 			case res.SupersedingValue != "":
 				chosen = newClaim(ClaimInput{
@@ -413,13 +443,23 @@ func (s *Store) rebuild(render bool) (Index, error) {
 				chosen.ResolvedConflictID = conflict.ID
 				idx.Claims[chosen.ID] = chosen
 				idx.EntityClaims[chosen.CanonicalEntity] = appendUnique(idx.EntityClaims[chosen.CanonicalEntity], chosen.ID)
+				idx.Tombstones[conflict.Existing.ID] = "conflict_resolved"
+				idx.Tombstones[conflict.Incoming.ID] = "conflict_resolved"
 			case res.ChosenClaimID == conflict.Incoming.ID:
 				chosen = conflict.Incoming
 				idx.Claims[chosen.ID] = chosen
 				idx.EntityClaims[chosen.CanonicalEntity] = appendUnique(idx.EntityClaims[chosen.CanonicalEntity], chosen.ID)
+				loserID = conflict.Existing.ID
 			case res.ChosenClaimID != "" && res.ChosenClaimID != conflict.Existing.ID:
 				return Index{}, fmt.Errorf("resolution %q chose claim %q outside conflict %q", res.ID, res.ChosenClaimID, conflict.ID)
 			}
+			if loser, ok := idx.Claims[loserID]; ok {
+				loser.Retracted = true
+				loser.RetractedBy = res.ID
+				idx.Claims[loser.ID] = loser
+			}
+			idx.Tombstones[loserID] = "conflict_resolved"
+			idx.Redirects[loserID] = chosen.ID
 			idx.Current[slotKey(chosen.CanonicalEntity, chosen.CanonicalKey)] = chosen.ID
 		case EventRetraction:
 			if ev.Retraction == nil {
@@ -475,6 +515,24 @@ func (s *Store) appendEvent(ev Event) error {
 	return f.Sync()
 }
 
+func (s *Store) withWriteLock(fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(s.canonPath(), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(s.canonPath(lockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
 func (s *Store) readEvents() ([]Event, error) {
 	path := s.canonPath(eventLogFile)
 	f, err := os.Open(path)
@@ -521,6 +579,9 @@ func (s *Store) renderProjections(idx Index) error {
 			}
 		}
 		if len(active) == 0 {
+			if err := os.Remove(filepath.Join(s.root, entity+".md")); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
 			continue
 		}
 		sort.Slice(active, func(i, j int) bool {
@@ -598,7 +659,7 @@ func newClaim(in ClaimInput, ts time.Time) Claim {
 		TS:              ts.UTC(),
 		ValueHash:       hashString(normalizeValue(value)),
 	}
-	c.ID = idFor("claim", entity, key, c.ValueHash, c.Provenance)
+	c.ID = idFor("claim", entity, key, c.ValueHash, c.Provenance, ts.UTC().Format(time.RFC3339Nano))
 	c.Hash = hashJSON(c)
 	return c
 }
@@ -616,16 +677,6 @@ func newIndex() Index {
 	}
 }
 
-func (idx Index) sameEntitySameValue(entity, valueHash string) string {
-	for _, id := range idx.EntityClaims[entity] {
-		c := idx.Claims[id]
-		if c.DuplicateOf == "" && !c.Retracted && c.ValueHash == valueHash {
-			return id
-		}
-	}
-	return ""
-}
-
 func slotKey(entity, key string) string {
 	return entity + "\x00" + key
 }
@@ -635,50 +686,11 @@ func canonicalEntity(s string) string {
 }
 
 func canonicalKey(s string) string {
-	n := normalizeText(s)
-	tokens := strings.Fields(n)
-	if len(tokens) == 0 {
+	slugged := slug(normalizeText(s))
+	if slugged == "" {
 		return "unknown"
 	}
-	mapped := make([]string, 0, len(tokens))
-	for _, tok := range tokens {
-		if repl, ok := keyAliases[tok]; ok {
-			tok = repl
-		}
-		if stopKeyWords[tok] {
-			continue
-		}
-		mapped = append(mapped, tok)
-	}
-	if len(mapped) == 0 {
-		mapped = tokens
-	}
-	if contains(mapped, "hq") {
-		mapped = removeToken(mapped, "location")
-	}
-	sort.Strings(mapped)
-	return strings.Join(dedupe(mapped), "_")
-}
-
-var keyAliases = map[string]string{
-	"aka":          "alias",
-	"called":       "alias",
-	"created":      "founded",
-	"creation":     "founded",
-	"established":  "founded",
-	"founding":     "founded",
-	"headquarters": "hq",
-	"headquarter":  "hq",
-	"office":       "hq",
-	"launched":     "founded",
-	"launch":       "founded",
-	"located":      "location",
-	"place":        "location",
-}
-
-var stopKeyWords = map[string]bool{
-	"a": true, "an": true, "at": true, "date": true, "is": true,
-	"of": true, "on": true, "the": true, "where": true, "when": true,
+	return slugged
 }
 
 var nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
@@ -727,26 +739,15 @@ func appendUnique(in []string, v string) []string {
 	return append(in, v)
 }
 
-func contains(in []string, v string) bool {
-	for _, item := range in {
-		if item == v {
-			return true
-		}
+func conflictFor(existing, incoming Claim, ts time.Time) Conflict {
+	return Conflict{
+		ID:           idFor("conflict", incoming.CanonicalEntity, incoming.CanonicalKey, existing.ValueHash, incoming.ValueHash, incoming.ID),
+		Entity:       existing.CanonicalEntity,
+		CanonicalKey: incoming.CanonicalKey,
+		Existing:     existing,
+		Incoming:     incoming,
+		TS:           ts,
 	}
-	return false
-}
-
-func removeToken(in []string, v string) []string {
-	out := in[:0]
-	for _, item := range in {
-		if item != v {
-			out = append(out, item)
-		}
-	}
-	if len(out) == 0 {
-		return in
-	}
-	return out
 }
 
 func idFor(parts ...string) string {

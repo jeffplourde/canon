@@ -54,19 +54,20 @@ Read / layout (never create facts):
 
 ## Identity resolution — the make-or-break
 
-`put_claim` only collapses/conflicts when two callers agree on `(entity, key)`. If they
-phrase the *same fact under different keys*, naive equality yields silent **duplicates** —
-the exact failure canon exists to kill, one layer up. v1 resolves this **deterministically**
-(no LLM): normalized title/alias matching + content hashing (simhash/minhash for near-dupes)
-+ an explicit `merge_notes`/alias mechanism that leaves tombstones/redirects. This must be
-proven by the demo (below), not assumed.
+`put_claim` collapses/conflicts only on exact canonical `(entity, key)` slots unless the
+caller explicitly declares an alias in a later tool. v1 must not guess semantic key
+equivalence on the write path: equal values under different keys can be unrelated
+(`employees=100`, `offices=100`), and different values under semantically similar keys
+(`founding date`, `first day`) need MELD-style embedding/NLI or explicit aliasing. That is
+roadmap, not v1. The v1 engine is conservative: exact slot conflict, explicit
+redirect/tombstone, and no silent overwrite.
 
 ## Release gate — the 3-agent demo (nothing ships until it passes clean)
 
 Scripted fixture, no narration allowed:
 - Three agents, one folder, overlapping writes on the same entity.
 - Includes at least one genuine contradiction, AND at least one **same-fact-different-keys**
-  case.
+  case that the demo surfaces honestly rather than false-merging.
 - Required result: **one canonical note; redirects/tombstones for the duplicates; one
   conflict object preserving both claims with provenance; zero silent clobbers.**
 
