@@ -62,6 +62,18 @@ Tools exposed:
 - `search`
 - `scan_external_changes`
 
+## Demo gate
+
+Run the release-gate fixture:
+
+```bash
+go run ./cmd/canon-demo
+```
+
+It races writers against one `(entity, key)`, verifies the conflict preserves both
+claims with provenance, checks duplicate redirects/tombstones, and confirms a
+same-fact-different-key case is surfaced as a candidate instead of silently merged.
+
 ## License
 
 Apache-2.0.

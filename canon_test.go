@@ -156,6 +156,13 @@ func TestEqualValuesUnderDifferentKeysDoNotCollapse(t *testing.T) {
 	if got.Status != ResultInserted || got.RedirectTo != "" {
 		t.Fatalf("employees/offices equal value collapsed: %+v", got)
 	}
+	idx, err := s.Rebuild()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Candidates) != 1 {
+		t.Fatalf("candidates = %d, want non-collapsing candidate report", len(idx.Candidates))
+	}
 }
 
 func TestConcurrentPutClaimsSerializeToConflict(t *testing.T) {

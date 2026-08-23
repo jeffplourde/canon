@@ -110,6 +110,13 @@ type ScanResult struct {
 	Ambiguous    []string `json:"ambiguous,omitempty"`
 }
 
+type Candidate struct {
+	Entity string `json:"entity"`
+	Left   Claim  `json:"left"`
+	Right  Claim  `json:"right"`
+	Reason string `json:"reason"`
+}
+
 type Event struct {
 	Type       string      `json:"type"`
 	ID         string      `json:"id"`
@@ -134,6 +141,7 @@ type Index struct {
 	Hash         string                `json:"hash"`
 	Claims       map[string]Claim      `json:"claims"`
 	Conflicts    map[string]Conflict   `json:"conflicts"`
+	Candidates   []Candidate           `json:"candidates,omitempty"`
 	Resolutions  map[string]Resolution `json:"resolutions"`
 	EntityClaims map[string][]string   `json:"entity_claims"`
 	Current      map[string]string     `json:"current"`
@@ -480,6 +488,8 @@ func (s *Store) rebuild(render bool) (Index, error) {
 		}
 	}
 	idx.Hash = hashIndex(idx)
+	idx.Candidates = idx.deriveCandidates()
+	idx.Hash = hashIndex(idx)
 	if err := s.writeIndex(idx); err != nil {
 		return Index{}, err
 	}
@@ -489,6 +499,38 @@ func (s *Store) rebuild(render bool) (Index, error) {
 		}
 	}
 	return idx, nil
+}
+
+func (idx Index) deriveCandidates() []Candidate {
+	var out []Candidate
+	for _, entity := range sortedKeys(idx.EntityClaims) {
+		ids := idx.EntityClaims[entity]
+		for i := 0; i < len(ids); i++ {
+			left := idx.Claims[ids[i]]
+			if left.DuplicateOf != "" || left.Retracted {
+				continue
+			}
+			for j := i + 1; j < len(ids); j++ {
+				right := idx.Claims[ids[j]]
+				if right.DuplicateOf != "" || right.Retracted {
+					continue
+				}
+				if left.CanonicalKey == right.CanonicalKey {
+					continue
+				}
+				if left.ValueHash != right.ValueHash {
+					continue
+				}
+				out = append(out, Candidate{
+					Entity: entity,
+					Left:   left,
+					Right:  right,
+					Reason: "same_entity_equal_value_different_key",
+				})
+			}
+		}
+	}
+	return out
 }
 
 func (s *Store) canonPath(parts ...string) string {
