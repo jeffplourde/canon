@@ -45,6 +45,22 @@ v1, in development. The release gate is a single demo that has to speak for itse
 
 If that demo needs narration to explain why it won, it isn't done.
 
+## MCP server
+
+Run the stdio MCP server against a folder:
+
+```bash
+go run ./cmd/canon-mcp --root /path/to/knowledge-folder
+```
+
+Tools exposed:
+
+- `put_claim`
+- `resolve_conflict`
+- `retract_claim`
+- `search`
+- `scan_external_changes`
+
 ## License
 
 Apache-2.0.

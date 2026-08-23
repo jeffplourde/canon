@@ -99,6 +99,13 @@ type Retraction struct {
 	TS         time.Time `json:"ts"`
 }
 
+type ScanResult struct {
+	FilesScanned int      `json:"files_scanned"`
+	Imported     int      `json:"imported"`
+	Skipped      int      `json:"skipped"`
+	Ambiguous    []string `json:"ambiguous,omitempty"`
+}
+
 type Event struct {
 	Type       string      `json:"type"`
 	ID         string      `json:"id"`
@@ -139,6 +146,10 @@ func Open(root string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func (s *Store) Root() string {
+	return s.root
 }
 
 func (s *Store) PutClaim(in ClaimInput) (PutResult, error) {
@@ -290,7 +301,67 @@ func (s *Store) Search(query string) ([]Claim, error) {
 	return out, nil
 }
 
+func (s *Store) ScanExternalChanges(provenance string) (ScanResult, error) {
+	if strings.TrimSpace(provenance) == "" {
+		provenance = "scan_external_changes"
+	}
+	idx, err := s.rebuild(false)
+	if err != nil {
+		return ScanResult{}, err
+	}
+	files, err := filepath.Glob(filepath.Join(s.root, "*.md"))
+	if err != nil {
+		return ScanResult{}, err
+	}
+	sort.Strings(files)
+	var result ScanResult
+	for _, path := range files {
+		result.FilesScanned++
+		claims, ambiguous, err := parseProjectionFile(path)
+		if err != nil {
+			return ScanResult{}, err
+		}
+		if ambiguous {
+			result.Ambiguous = append(result.Ambiguous, filepath.Base(path))
+		}
+		for _, c := range claims {
+			current, ok := idx.Claims[c.ID]
+			if ok && current.Hash == c.Hash && valuesEqual(current.Value, c.Value) {
+				result.Skipped++
+				continue
+			}
+			_, err := s.PutClaim(ClaimInput{
+				Entity:     c.Entity,
+				Key:        c.Key,
+				Value:      c.Value,
+				Provenance: provenance + ":" + filepath.Base(path),
+			})
+			if err != nil {
+				return ScanResult{}, err
+			}
+			result.Imported++
+			idx, err = s.Rebuild()
+			if err != nil {
+				return ScanResult{}, err
+			}
+		}
+	}
+	if len(result.Ambiguous) > 0 {
+		if err := s.writeImportInbox(result.Ambiguous); err != nil {
+			return ScanResult{}, err
+		}
+	}
+	if _, err := s.Rebuild(); err != nil {
+		return ScanResult{}, err
+	}
+	return result, nil
+}
+
 func (s *Store) Rebuild() (Index, error) {
+	return s.rebuild(true)
+}
+
+func (s *Store) rebuild(render bool) (Index, error) {
 	events, err := s.readEvents()
 	if err != nil {
 		return Index{}, err
@@ -372,8 +443,10 @@ func (s *Store) Rebuild() (Index, error) {
 	if err := s.writeIndex(idx); err != nil {
 		return Index{}, err
 	}
-	if err := s.renderProjections(idx); err != nil {
-		return Index{}, err
+	if render {
+		if err := s.renderProjections(idx); err != nil {
+			return Index{}, err
+		}
 	}
 	return idx, nil
 }
@@ -713,4 +786,93 @@ func displayTitle(s string) string {
 		return "Unknown"
 	}
 	return s
+}
+
+type parsedProjectionClaim struct {
+	ID     string
+	Entity string
+	Key    string
+	Value  string
+	Hash   string
+}
+
+var claimCommentRE = regexp.MustCompile(`<!--\s*canon-claim\s+id="([^"]+)"\s+key="([^"]+)"\s+hash="([^"]+)"\s*-->`)
+
+func parseProjectionFile(path string) ([]parsedProjectionClaim, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	lines := strings.Split(string(data), "\n")
+	entity := ""
+	for _, line := range lines {
+		if v, ok := strings.CutPrefix(line, "canon_entity: "); ok {
+			entity = strings.TrimSpace(v)
+			break
+		}
+	}
+	if entity == "" {
+		entity = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	}
+	var claims []parsedProjectionClaim
+	for i, line := range lines {
+		m := claimCommentRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		if i+1 >= len(lines) {
+			continue
+		}
+		valueLine := strings.TrimSpace(lines[i+1])
+		prefix := "- **" + m[2] + "**: "
+		if !strings.HasPrefix(valueLine, prefix) {
+			continue
+		}
+		claims = append(claims, parsedProjectionClaim{
+			ID:     m[1],
+			Entity: entity,
+			Key:    m[2],
+			Value:  strings.TrimSpace(strings.TrimPrefix(valueLine, prefix)),
+			Hash:   m[3],
+		})
+	}
+	ambiguous := len(claims) == 0 && strings.TrimSpace(stripFrontmatterAndHeading(lines)) != ""
+	return claims, ambiguous, nil
+}
+
+func stripFrontmatterAndHeading(lines []string) string {
+	out := make([]string, 0, len(lines))
+	inFrontmatter := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if i == 0 && trimmed == "---" {
+			inFrontmatter = true
+			continue
+		}
+		if inFrontmatter {
+			if trimmed == "---" {
+				inFrontmatter = false
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func (s *Store) writeImportInbox(files []string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	sort.Strings(files)
+	var b strings.Builder
+	b.WriteString("# Import inbox\n\n")
+	b.WriteString("These Markdown files contain prose that canon could not safely import as claims.\n\n")
+	for _, file := range files {
+		b.WriteString("- " + file + "\n")
+	}
+	return os.WriteFile(s.canonPath("import-inbox.md"), []byte(b.String()), 0o644)
 }
