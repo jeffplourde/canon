@@ -33,4 +33,16 @@ func TestDemoGate(t *testing.T) {
 	if len(got.CanonicalNotes) != 1 || got.CanonicalNotes[0] != "project-canon.md" {
 		t.Fatalf("canonical notes = %v", got.CanonicalNotes)
 	}
+	if got.ProjectionClaimLines != 3 || got.SearchLicenseResults != 1 {
+		t.Fatalf("projection/search = lines %d search %d", got.ProjectionClaimLines, got.SearchLicenseResults)
+	}
+	if got.SupersedeProjectionLines != 1 || len(got.SupersedeSearchValues) != 1 || got.SupersedeSearchValues[0] != "green" {
+		t.Fatalf("supersede probe = lines %d values %v", got.SupersedeProjectionLines, got.SupersedeSearchValues)
+	}
+	if got.TwoFileScanImported != 2 || got.TwoFileScanConflicts != 2 {
+		t.Fatalf("two-file scan = imported %d conflicts %d", got.TwoFileScanImported, got.TwoFileScanConflicts)
+	}
+	if len(got.DivergenceNotes) != 2 || got.DivergenceSearchResults != 2 {
+		t.Fatalf("divergence probe = notes %v search %d", got.DivergenceNotes, got.DivergenceSearchResults)
+	}
 }

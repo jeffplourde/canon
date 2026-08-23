@@ -178,7 +178,7 @@ func (s *Store) putClaimLocked(in ClaimInput) (PutResult, error) {
 	if err := validateClaim(in); err != nil {
 		return PutResult{}, err
 	}
-	idx, err := s.Rebuild()
+	idx, err := s.rebuildLocked(true)
 	if err != nil {
 		return PutResult{}, err
 	}
@@ -198,7 +198,7 @@ func (s *Store) putClaimLocked(in ClaimInput) (PutResult, error) {
 			if err := s.appendEvent(Event{Type: EventClaim, ID: claim.ID, TS: now, Claim: &claim}); err != nil {
 				return PutResult{}, err
 			}
-			idx, err = s.Rebuild()
+			idx, err = s.rebuildLocked(true)
 			if err != nil {
 				return PutResult{}, err
 			}
@@ -208,7 +208,7 @@ func (s *Store) putClaimLocked(in ClaimInput) (PutResult, error) {
 		if err := s.appendEvent(Event{Type: EventConflict, ID: conflict.ID, TS: now, Conflict: &conflict}); err != nil {
 			return PutResult{}, err
 		}
-		idx, err = s.Rebuild()
+		idx, err = s.rebuildLocked(true)
 		if err != nil {
 			return PutResult{}, err
 		}
@@ -218,7 +218,7 @@ func (s *Store) putClaimLocked(in ClaimInput) (PutResult, error) {
 	if err := s.appendEvent(Event{Type: EventClaim, ID: claim.ID, TS: now, Claim: &claim}); err != nil {
 		return PutResult{}, err
 	}
-	idx, err = s.Rebuild()
+	idx, err = s.rebuildLocked(true)
 	if err != nil {
 		return PutResult{}, err
 	}
@@ -236,7 +236,7 @@ func (s *Store) ResolveConflict(conflictID, chosenClaimID, supersedingValue, pro
 }
 
 func (s *Store) resolveConflictLocked(conflictID, chosenClaimID, supersedingValue, provenance string) (Resolution, error) {
-	idx, err := s.Rebuild()
+	idx, err := s.rebuildLocked(true)
 	if err != nil {
 		return Resolution{}, err
 	}
@@ -263,7 +263,7 @@ func (s *Store) resolveConflictLocked(conflictID, chosenClaimID, supersedingValu
 	if err := s.appendEvent(Event{Type: EventResolution, ID: res.ID, TS: now, Resolution: &res}); err != nil {
 		return Resolution{}, err
 	}
-	if _, err := s.Rebuild(); err != nil {
+	if _, err := s.rebuildLocked(true); err != nil {
 		return Resolution{}, err
 	}
 	return res, nil
@@ -280,7 +280,7 @@ func (s *Store) RetractClaim(claimID, provenance string) (Retraction, error) {
 }
 
 func (s *Store) retractClaimLocked(claimID, provenance string) (Retraction, error) {
-	idx, err := s.Rebuild()
+	idx, err := s.rebuildLocked(true)
 	if err != nil {
 		return Retraction{}, err
 	}
@@ -297,36 +297,55 @@ func (s *Store) retractClaimLocked(claimID, provenance string) (Retraction, erro
 	if err := s.appendEvent(Event{Type: EventRetraction, ID: ret.ID, TS: now, Retraction: &ret}); err != nil {
 		return Retraction{}, err
 	}
-	if _, err := s.Rebuild(); err != nil {
+	if _, err := s.rebuildLocked(true); err != nil {
 		return Retraction{}, err
 	}
 	return ret, nil
 }
 
 func (s *Store) Search(query string) ([]Claim, error) {
-	idx, err := s.Rebuild()
-	if err != nil {
-		return nil, err
-	}
+	var out []Claim
+	err := s.withWriteLock(func() error {
+		idx, err := s.rebuildLocked(true)
+		if err != nil {
+			return err
+		}
+		out = searchIndex(idx, query)
+		return nil
+	})
+	return out, err
+}
+
+func searchIndex(idx Index, query string) []Claim {
 	q := normalizeText(query)
 	out := []Claim{}
-	for _, id := range sortedClaimIDs(idx.Claims) {
-		c := idx.Claims[id]
-		if c.DuplicateOf != "" || c.Retracted {
+	for _, slot := range sortedKeys(idx.Current) {
+		c := idx.Claims[idx.Current[slot]]
+		if c.Retracted {
 			continue
 		}
 		if q == "" || strings.Contains(c.CanonicalEntity, q) || strings.Contains(c.CanonicalKey, q) || strings.Contains(normalizeText(c.Value), q) {
 			out = append(out, c)
 		}
 	}
-	return out, nil
+	return out
 }
 
 func (s *Store) ScanExternalChanges(provenance string) (ScanResult, error) {
+	var out ScanResult
+	err := s.withWriteLock(func() error {
+		var err error
+		out, err = s.scanExternalChangesLocked(provenance)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) scanExternalChangesLocked(provenance string) (ScanResult, error) {
 	if strings.TrimSpace(provenance) == "" {
 		provenance = "scan_external_changes"
 	}
-	idx, err := s.rebuild(false)
+	idx, err := s.rebuildLocked(false)
 	if err != nil {
 		return ScanResult{}, err
 	}
@@ -335,23 +354,33 @@ func (s *Store) ScanExternalChanges(provenance string) (ScanResult, error) {
 		return ScanResult{}, err
 	}
 	sort.Strings(files)
-	var result ScanResult
+	type snapshot struct {
+		path      string
+		claims    []parsedProjectionClaim
+		ambiguous bool
+	}
+	var snapshots []snapshot
 	for _, path := range files {
-		result.FilesScanned++
 		claims, ambiguous, err := parseProjectionFile(path)
 		if err != nil {
 			return ScanResult{}, err
 		}
-		if ambiguous {
+		snapshots = append(snapshots, snapshot{path: path, claims: claims, ambiguous: ambiguous})
+	}
+	var result ScanResult
+	result.FilesScanned = len(snapshots)
+	for _, snap := range snapshots {
+		path := snap.path
+		if snap.ambiguous {
 			result.Ambiguous = append(result.Ambiguous, filepath.Base(path))
 		}
-		for _, c := range claims {
+		for _, c := range snap.claims {
 			current, ok := idx.Claims[c.ID]
 			if ok && current.Hash == c.Hash && valuesEqual(current.Value, c.Value) {
 				result.Skipped++
 				continue
 			}
-			_, err := s.PutClaim(ClaimInput{
+			_, err := s.putClaimLocked(ClaimInput{
 				Entity:     c.Entity,
 				Key:        c.Key,
 				Value:      c.Value,
@@ -361,7 +390,7 @@ func (s *Store) ScanExternalChanges(provenance string) (ScanResult, error) {
 				return ScanResult{}, err
 			}
 			result.Imported++
-			idx, err = s.Rebuild()
+			idx, err = s.rebuildLocked(true)
 			if err != nil {
 				return ScanResult{}, err
 			}
@@ -372,17 +401,23 @@ func (s *Store) ScanExternalChanges(provenance string) (ScanResult, error) {
 			return ScanResult{}, err
 		}
 	}
-	if _, err := s.Rebuild(); err != nil {
+	if _, err := s.rebuildLocked(true); err != nil {
 		return ScanResult{}, err
 	}
 	return result, nil
 }
 
 func (s *Store) Rebuild() (Index, error) {
-	return s.rebuild(true)
+	var idx Index
+	err := s.withWriteLock(func() error {
+		var err error
+		idx, err = s.rebuildLocked(true)
+		return err
+	})
+	return idx, err
 }
 
-func (s *Store) rebuild(render bool) (Index, error) {
+func (s *Store) rebuildLocked(render bool) (Index, error) {
 	events, err := s.readEvents()
 	if err != nil {
 		return Index{}, err
@@ -453,6 +488,13 @@ func (s *Store) rebuild(render bool) (Index, error) {
 				idx.EntityClaims[chosen.CanonicalEntity] = appendUnique(idx.EntityClaims[chosen.CanonicalEntity], chosen.ID)
 				idx.Tombstones[conflict.Existing.ID] = "conflict_resolved"
 				idx.Tombstones[conflict.Incoming.ID] = "conflict_resolved"
+				for _, id := range []string{conflict.Existing.ID, conflict.Incoming.ID} {
+					if claim, ok := idx.Claims[id]; ok {
+						claim.Retracted = true
+						claim.RetractedBy = res.ID
+						idx.Claims[id] = claim
+					}
+				}
 			case res.ChosenClaimID == conflict.Incoming.ID:
 				chosen = conflict.Incoming
 				idx.Claims[chosen.ID] = chosen
@@ -502,19 +544,14 @@ func (s *Store) rebuild(render bool) (Index, error) {
 }
 
 func (idx Index) deriveCandidates() []Candidate {
+	current := idx.currentClaims()
 	var out []Candidate
-	for _, entity := range sortedKeys(idx.EntityClaims) {
-		ids := idx.EntityClaims[entity]
-		for i := 0; i < len(ids); i++ {
-			left := idx.Claims[ids[i]]
-			if left.DuplicateOf != "" || left.Retracted {
-				continue
-			}
-			for j := i + 1; j < len(ids); j++ {
-				right := idx.Claims[ids[j]]
-				if right.DuplicateOf != "" || right.Retracted {
-					continue
-				}
+	for _, entity := range sortedKeys(current) {
+		claims := current[entity]
+		for i := 0; i < len(claims); i++ {
+			left := claims[i]
+			for j := i + 1; j < len(claims); j++ {
+				right := claims[j]
 				if left.CanonicalKey == right.CanonicalKey {
 					continue
 				}
@@ -529,6 +566,23 @@ func (idx Index) deriveCandidates() []Candidate {
 				})
 			}
 		}
+	}
+	return out
+}
+
+func (idx Index) currentClaims() map[string][]Claim {
+	out := map[string][]Claim{}
+	for _, slot := range sortedKeys(idx.Current) {
+		c := idx.Claims[idx.Current[slot]]
+		if c.Retracted || c.DuplicateOf != "" {
+			continue
+		}
+		out[c.CanonicalEntity] = append(out[c.CanonicalEntity], c)
+	}
+	for entity := range out {
+		sort.Slice(out[entity], func(i, j int) bool {
+			return out[entity][i].CanonicalKey < out[entity][j].CanonicalKey
+		})
 	}
 	return out
 }
@@ -611,24 +665,15 @@ func (s *Store) writeIndex(idx Index) error {
 }
 
 func (s *Store) renderProjections(idx Index) error {
+	current := idx.currentClaims()
 	for _, entity := range sortedKeys(idx.EntityClaims) {
-		ids := idx.EntityClaims[entity]
-		active := []Claim{}
-		for _, id := range ids {
-			c := idx.Claims[id]
-			if c.DuplicateOf == "" && !c.Retracted {
-				active = append(active, c)
-			}
-		}
+		active := current[entity]
 		if len(active) == 0 {
 			if err := os.Remove(filepath.Join(s.root, entity+".md")); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 			continue
 		}
-		sort.Slice(active, func(i, j int) bool {
-			return active[i].CanonicalKey < active[j].CanonicalKey
-		})
 		var b strings.Builder
 		b.WriteString("---\n")
 		b.WriteString("canon_entity: " + entity + "\n")

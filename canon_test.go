@@ -227,6 +227,24 @@ func TestRebuildRepairsRacyLogAsConflict(t *testing.T) {
 	if idx.Current[slotKey(a.CanonicalEntity, a.CanonicalKey)] != a.ID {
 		t.Fatalf("current was overwritten by racy claim: %+v", idx.Current)
 	}
+	note := readFile(t, filepath.Join(s.root, "canon.md"))
+	if strings.Count(note, "canon-claim") != 1 || strings.Contains(note, "debating") {
+		t.Fatalf("projection leaked conflicted claim:\n%s", note)
+	}
+	claims, err := s.Search("status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Value != "ratified" {
+		t.Fatalf("search claims = %+v, want only current ratified fact", claims)
+	}
+	files, err := filepath.Glob(filepath.Join(s.root, "conflicts", "*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("conflict files = %d, want 1", len(files))
+	}
 }
 
 func TestCASPreventsLWWClobber(t *testing.T) {
@@ -326,6 +344,35 @@ func TestResolveConflictChooseIncomingLeavesOneProjectedFact(t *testing.T) {
 	}
 }
 
+func TestResolveConflictSupersedeLeavesOneProjectedFact(t *testing.T) {
+	s := testStore(t)
+	first, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "color", Value: "red", Provenance: "agent-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicted, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "color", Value: "blue", Provenance: "agent-b", BaseHash: first.IndexHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveConflict(conflicted.Conflict.ID, "", "green", "jeff"); err != nil {
+		t.Fatal(err)
+	}
+	note := readFile(t, filepath.Join(s.root, "canon.md"))
+	if strings.Count(note, "canon-claim") != 1 {
+		t.Fatalf("projection has multiple facts after supersede:\n%s", note)
+	}
+	if strings.Contains(note, "red") || strings.Contains(note, "blue") || !strings.Contains(note, "green") {
+		t.Fatalf("projection did not keep only superseding value:\n%s", note)
+	}
+	claims, err := s.Search("color")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Value != "green" {
+		t.Fatalf("search claims = %+v, want only superseding value", claims)
+	}
+}
+
 func TestRepeatedReassertGetsUniqueClaimID(t *testing.T) {
 	s := testStore(t)
 	first, err := s.PutClaim(ClaimInput{Entity: "Canon", Key: "status", Value: "ratified", Provenance: "agent-a"})
@@ -359,6 +406,35 @@ func TestRetractDeletesProjection(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("projection still exists after retract: err=%v", err)
+	}
+}
+
+func TestScanExternalChangesSnapshotsAllFilesBeforeImport(t *testing.T) {
+	s := testStore(t)
+	if _, err := s.PutClaim(ClaimInput{Entity: "Acme", Key: "status", Value: "active", Provenance: "agent-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutClaim(ClaimInput{Entity: "Beta", Key: "status", Value: "active", Provenance: "agent-b"}); err != nil {
+		t.Fatal(err)
+	}
+	acmePath := filepath.Join(s.root, "acme.md")
+	betaPath := filepath.Join(s.root, "beta.md")
+	writeFile(t, acmePath, strings.Replace(readFile(t, acmePath), "active", "paused", 1))
+	writeFile(t, betaPath, strings.Replace(readFile(t, betaPath), "active", "paused", 1))
+
+	got, err := s.ScanExternalChanges("human-edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Imported != 2 {
+		t.Fatalf("imported = %d, want 2; result=%+v", got.Imported, got)
+	}
+	idx, err := s.Rebuild()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Conflicts) != 2 {
+		t.Fatalf("conflicts = %d, want 2 after two-file scan", len(idx.Conflicts))
 	}
 }
 
@@ -407,4 +483,11 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func writeFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
