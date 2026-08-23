@@ -1,3 +1,3 @@
 module github.com/jeffplourde/canon
 
-go 1.23
+go 1.22
