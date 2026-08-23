@@ -110,13 +110,6 @@ type ScanResult struct {
 	Ambiguous    []string `json:"ambiguous,omitempty"`
 }
 
-type Candidate struct {
-	Entity string `json:"entity"`
-	Left   Claim  `json:"left"`
-	Right  Claim  `json:"right"`
-	Reason string `json:"reason"`
-}
-
 type Event struct {
 	Type       string      `json:"type"`
 	ID         string      `json:"id"`
@@ -141,7 +134,6 @@ type Index struct {
 	Hash         string                `json:"hash"`
 	Claims       map[string]Claim      `json:"claims"`
 	Conflicts    map[string]Conflict   `json:"conflicts"`
-	Candidates   []Candidate           `json:"candidates,omitempty"`
 	Resolutions  map[string]Resolution `json:"resolutions"`
 	EntityClaims map[string][]string   `json:"entity_claims"`
 	Current      map[string]string     `json:"current"`
@@ -530,8 +522,6 @@ func (s *Store) rebuildLocked(render bool) (Index, error) {
 		}
 	}
 	idx.Hash = hashIndex(idx)
-	idx.Candidates = idx.deriveCandidates()
-	idx.Hash = hashIndex(idx)
 	if err := s.writeIndex(idx); err != nil {
 		return Index{}, err
 	}
@@ -541,33 +531,6 @@ func (s *Store) rebuildLocked(render bool) (Index, error) {
 		}
 	}
 	return idx, nil
-}
-
-func (idx Index) deriveCandidates() []Candidate {
-	current := idx.currentClaims()
-	var out []Candidate
-	for _, entity := range sortedKeys(current) {
-		claims := current[entity]
-		for i := 0; i < len(claims); i++ {
-			left := claims[i]
-			for j := i + 1; j < len(claims); j++ {
-				right := claims[j]
-				if left.CanonicalKey == right.CanonicalKey {
-					continue
-				}
-				if left.ValueHash != right.ValueHash {
-					continue
-				}
-				out = append(out, Candidate{
-					Entity: entity,
-					Left:   left,
-					Right:  right,
-					Reason: "same_entity_equal_value_different_key",
-				})
-			}
-		}
-	}
-	return out
 }
 
 func (idx Index) currentClaims() map[string][]Claim {

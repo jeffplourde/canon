@@ -45,8 +45,7 @@ Mutating (truth):
 - `retract_claim { claim_id, provenance }`
 
 Read / layout (never create facts):
-- `search { query }` — returns canonical claims/notes + redirects; no dupes unless the
-  caller explicitly asks for candidates.
+- `search { query }` — returns canonical claims/notes + redirects; no dupes.
 - `render_entity { entity }`, `move_projection`, `merge_projection` (layout only).
 - `scan_external_changes` — **batch** import of hand edits (on MCP start + explicit call).
   Parses known frontmatter/claim blocks into claims; ambiguous prose lands as an
@@ -56,18 +55,25 @@ Read / layout (never create facts):
 
 `put_claim` collapses/conflicts only on exact canonical `(entity, key)` slots unless the
 caller explicitly declares an alias in a later tool. v1 must not guess semantic key
-equivalence on the write path: equal values under different keys can be unrelated
-(`employees=100`, `offices=100`), and different values under semantically similar keys
-(`founding date`, `first day`) need MELD-style embedding/NLI or explicit aliasing. That is
-roadmap, not v1. The v1 engine is conservative: exact slot conflict, explicit
-redirect/tombstone, and no silent overwrite.
+equivalence — not on the write path, and not as an after-the-fact report either: equal
+values under different keys can be unrelated (`employees=100`, `offices=100`), and
+different values under semantically similar keys (`founding date`, `first day`) need
+MELD-style embedding/NLI or explicit aliasing.
+
+**Semantic same-fact-different-key detection is MELD roadmap, not v1.** v1 ships no
+heuristic for it — no equal-value "candidate" report, no thesaurus, no scoring. Claims
+under different keys simply stay separate claims, which is the honest outcome; the demo
+shows that divergence rather than papering over it. When it lands it will be embedding/NLI
+plus explicit aliasing, and it will emit real claims/conflicts, not advisory hints.
+
+The v1 engine is conservative: exact slot conflict, explicit redirect/tombstone, and no
+silent overwrite.
 
 ## Release gate — the 3-agent demo (nothing ships until it passes clean)
 
 Scripted fixture, no narration allowed:
 - Three agents, one folder, overlapping writes on the same entity.
-- Includes at least one genuine contradiction, AND at least one **same-fact-different-keys**
-  case that the demo surfaces honestly rather than false-merging.
+- Includes at least one genuine contradiction.
 - Required result: **one canonical note; redirects/tombstones for the duplicates; one
   conflict object preserving both claims with provenance; zero silent clobbers.**
 
@@ -94,5 +100,6 @@ MELD (arXiv:2608.16357, 2026-08-17) defines a five-outcome reconciliation for di
 agentic memories — insert / merge / relate / conflict / reject — and holds that "a detected
 contradiction is preserved for later adjudication, never silently resolved." **canon v1 is
 the deterministic subset** of that procedure (insert / conflict / reject on claim-key
-identity + hash); merge/relate (MELD's embedding+NLI outcomes) are the roadmap. MELD being
-*federated* is the validation of the eventual substrate on-ramp.
+identity + hash); merge/relate (MELD's embedding+NLI outcomes) are the roadmap — that is
+where semantic same-fact-different-key identity belongs, and v1 does not approximate it.
+MELD being *federated* is the validation of the eventual substrate on-ramp.

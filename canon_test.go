@@ -78,7 +78,7 @@ func TestPutClaimInsertCollapseConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(idx.Claims) != 2 {
-		t.Fatalf("claims = %d, want original + duplicate claim event; conflict candidate is preserved in conflict", len(idx.Claims))
+		t.Fatalf("claims = %d, want original + duplicate claim event; the conflicting claim is preserved in the conflict", len(idx.Claims))
 	}
 	if len(idx.Conflicts) != 1 {
 		t.Fatalf("conflicts = %d, want 1", len(idx.Conflicts))
@@ -139,7 +139,7 @@ func TestDifferentKeysDifferentSpellingsDoNotSilentlyMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Status != ResultInserted {
-		t.Fatalf("status = %q, want separate candidate until alias/semantic identity exists", got.Status)
+		t.Fatalf("status = %q, want a separate claim until an alias is declared", got.Status)
 	}
 }
 
@@ -160,8 +160,11 @@ func TestEqualValuesUnderDifferentKeysDoNotCollapse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(idx.Candidates) != 1 {
-		t.Fatalf("candidates = %d, want non-collapsing candidate report", len(idx.Candidates))
+	if len(idx.Current) != 2 {
+		t.Fatalf("current slots = %d, want employees and offices held separately", len(idx.Current))
+	}
+	if len(idx.Redirects) != 0 {
+		t.Fatalf("redirects = %v, want none for distinct keys", idx.Redirects)
 	}
 }
 

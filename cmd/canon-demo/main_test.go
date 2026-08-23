@@ -24,9 +24,6 @@ func TestDemoGate(t *testing.T) {
 	if got.ConflictCount != 1 || !got.ConflictPreservesClaims {
 		t.Fatalf("conflict result = count %d preserves %v", got.ConflictCount, got.ConflictPreservesClaims)
 	}
-	if got.Candidates != 1 {
-		t.Fatalf("same-fact-different-key candidates = %d, want 1", got.Candidates)
-	}
 	if got.SilentClobbers != 0 {
 		t.Fatalf("silent clobbers = %d", got.SilentClobbers)
 	}

@@ -30,8 +30,8 @@ engine never adjudicates on its own, and never silently drops a write.
   everything.
 - **No black box.** No LLM on the write path, no vector database, no graph, no
   background file watcher. v1 identity is deterministic and conservative: exact
-  canonical `(entity, key)` slots collapse or conflict; semantic key equivalence is
-  not guessed on the write path.
+  canonical `(entity, key)` slots collapse or conflict. Semantic key equivalence is
+  never guessed — claims under different keys stay separate claims.
 - **Reachable from anywhere.** It's an MCP server — Claude Code, claude.ai, Cursor, or
   any MCP client shares the same source of truth.
 
@@ -41,10 +41,17 @@ v1, in development. The release gate is a single demo that has to speak for itse
 
 > three agents, one folder, overlapping writes → **one canonical note, tombstones for
 > the duplicates, one conflict object preserving both claims, zero silent clobbers**.
-> Same-fact-different-key cases must be surfaced honestly, not false-merged by a toy
-> thesaurus.
 
 If that demo needs narration to explain why it won, it isn't done.
+
+### Not in v1
+
+Semantic **same-fact-different-key** identity — recognizing that `founding date` and
+`first day` are the same fact — is deliberately out. It needs embedding/NLI plus explicit
+aliasing (the MELD merge/relate outcomes), and v1 ships no heuristic stand-in for it: no
+equal-value guessing, no toy thesaurus. Two agents writing the same fact under different
+keys get two claims, and the demo shows exactly that divergence rather than hiding it.
+That work is roadmap.
 
 ## MCP server
 
@@ -71,8 +78,8 @@ go run ./cmd/canon-demo
 ```
 
 It races writers against one `(entity, key)`, verifies the conflict preserves both
-claims with provenance, checks duplicate redirects/tombstones, and confirms a
-same-fact-different-key case is surfaced as a candidate instead of silently merged.
+claims with provenance, checks duplicate redirects/tombstones, and probes that claims
+written under different keys stay visibly separate instead of being silently merged.
 
 ## License
 

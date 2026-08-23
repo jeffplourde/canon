@@ -21,7 +21,6 @@ type summary struct {
 	ConflictPreservesClaims       bool     `json:"conflict_preserves_claims"`
 	DuplicateRedirects            int      `json:"duplicate_redirects"`
 	Tombstones                    int      `json:"tombstones"`
-	Candidates                    int      `json:"same_fact_different_key_candidates"`
 	CanonicalNotes                []string `json:"canonical_notes"`
 	ProjectionClaimLines          int      `json:"projection_claim_lines"`
 	ProjectionContainsCurrentFact bool     `json:"projection_contains_current_fact"`
@@ -203,7 +202,6 @@ func run(root string) (summary, error) {
 		ConflictPreservesClaims:       preserves,
 		DuplicateRedirects:            len(idx.Redirects),
 		Tombstones:                    len(idx.Tombstones),
-		Candidates:                    len(idx.Candidates),
 		CanonicalNotes:                notes,
 		ProjectionClaimLines:          strings.Count(string(noteBody), "canon-claim"),
 		ProjectionContainsCurrentFact: strings.Contains(string(noteBody), current[0].Value),
@@ -220,7 +218,6 @@ func run(root string) (summary, error) {
 		out.ConflictPreservesClaims &&
 		out.DuplicateRedirects >= 1 &&
 		out.Tombstones >= 1 &&
-		out.Candidates >= 1 &&
 		len(out.CanonicalNotes) == 1 &&
 		out.CanonicalNotes[0] == "project-canon.md" &&
 		out.ProjectionClaimLines == 3 &&
@@ -332,11 +329,6 @@ func silentClobbers(idx canon.Index) int {
 	var n int
 	for _, conflict := range idx.Conflicts {
 		if conflict.Existing.ID == "" || conflict.Incoming.ID == "" {
-			n++
-		}
-	}
-	for _, candidate := range idx.Candidates {
-		if candidate.Left.ID == "" || candidate.Right.ID == "" {
 			n++
 		}
 	}
